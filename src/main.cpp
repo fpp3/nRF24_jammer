@@ -1,812 +1,702 @@
-#include "bitmap.h"
-#include "html.h"
+#include "Arduino.h"
+#include "Preferences.h"
+
+#include "Button2.h"
+#include "Fonts/Picopixel.h"
+#include "PCF8814.h"
+#include "s3ui.h"
+
+#include "bitmaps.h"
 #include "jam.h"
-#include "options.h"
-#include "serial.h"
 
-void updateDisplay(int menuNum) {
-  display.clearDisplay();
-  const uint8_t *bitmap = (menu_number == 0)   ? bitmap_bluetooth_jammer
-                          : (menu_number == 1) ? bitmap_drone_jammer
-                          : (menu_number == 2) ? bitmap_wifi_jammer
-                          : (menu_number == 3) ? bitmap_ble_jammer
-                          : (menu_number == 4) ? bitmap_zigbee_jammer
-                          : (menu_number == 5) ? bitmap_misc_jammer
-                                               : bitmap_access_point;
-  display.drawBitmap(0, 0, bitmap, 128, 64, WHITE);
-  display.display();
-}
+#define PIN_VBAT 36
+#define PIN_OK 25
+#define PIN_NEXT 26
+#define PIN_PREV 27
+#define VBAT_VOLTAGE_EMPTY 2.8f
+#define VBAT_VOLTAGE_FULL 3.3f
 
-void handlernRF24Pins() {
-  nrf24_count = server.arg("count").toInt();
-  String ceStr = server.arg("ce");
-  String csnStr = server.arg("csn");
-  auto SplitStr = [](const String &str, int *arr, int maxCount) {
-    int idx = 0;
-    int start = 0;
-    while (idx < maxCount) {
-      int sep = str.indexOf('|', start);
-      if (sep == -1)
-        sep = str.length();
-      String part = str.substring(start, sep);
-      arr[idx++] = part.toInt();
-      if (sep == str.length())
-        break;
-      start = sep + 1;
-    }
-  };
-  SplitStr(ceStr, ce_pins, nrf24_count);
-  SplitStr(csnStr, csn_pins, nrf24_count);
-  for (int i = 0; i < nrf24_count; i++) {
-    EEPROM.write(74 + i, ce_pins[i]);
-    EEPROM.write(104 + i, csn_pins[i]);
-  }
-  EEPROM.write(134, nrf24_count);
-  EEPROM.commit();
-  server.send(200, "text/html", html);
-}
+s3ui ui;
+PCF8814 display(19, 18, 23, 21);
+Button2 buttonOk;
+Button2 buttonNext;
+Button2 buttonPrev;
 
-void handlenRF24Init() {
-  nrf24_count = EEPROM.read(134);
-  if (nrf24_count > 30) {
-    nrf24_count = 0;
-    return;
-  }
-  for (int i = 0; i < nrf24_count; i++) {
-    ce_pins[i] = EEPROM.read(74 + i);
-    csn_pins[i] = EEPROM.read(104 + i);
-  }
-}
+const uint8_t displayWidth = 96;
+const uint8_t displayHeight = 65;
+const char *CONFIG_NAMESPACE PROGMEM = "jammer";
+const char *CONFIG_KEY_RADIO_NUM PROGMEM = "radio_count";
+const char *CONFIG_KEY_RADIO_CONFIG_STRUCT PROGMEM = "radio_cfg";
+const char *CONFIG_KEY_RADIO_JAM_MODE PROGMEM = "radio_jam_mode";
+const char *CONFIG_MANDATORY_KEYS[] PROGMEM = {CONFIG_KEY_RADIO_NUM, CONFIG_KEY_RADIO_JAM_MODE, nullptr};
 
-void handleRoot() {
-  if (nrf24_count <= 0) {
-    server.send(200, "text/html", html_nrf24_settings);
-  } else {
-    server.send(200, "text/html", html);
-  }
-}
+const String option_allJam PROGMEM = "All channels (sequential)";
+const String option_randomJam PROGMEM = "All channels (random)";
+const String option_return PROGMEM = "Return";
 
-void sendHtmlAndExecute(const char *htmlResponse, void (*action)() = nullptr) {
-  server.send(200, "text/html", htmlResponse);
-  delay(500);
-  if (action)
-    action();
-}
+const String title_menu_main PROGMEM = "Main Menu";
+const String title_menu_btJam PROGMEM = "Bluetooth Jam";
+const String title_menu_wifiJam PROGMEM = "WiFi Jam";
+const String title_menu_bleJam PROGMEM = "BLE Jam";
+const String title_menu_zigbeeJam PROGMEM = "Zigbee Jam";
+const String title_menu_droneJam PROGMEM = "Drone Jam";
+const String title_menu_miscJam PROGMEM = "Misc Jam";
+const String title_menu_settings PROGMEM = "Settings";
+const String title_menu_about PROGMEM = "About";
+const String title_menu_radios PROGMEM = "Radios";
+const String title_menu_jammingModes PROGMEM = "Jamming Mode";
 
-void jamHandler(String htmlResponse, void (*jamFunction)(),
-                const unsigned char *bitmap) {
-  display.clearDisplay();
-  display.drawBitmap(0, 0, bitmap, 128, 64, WHITE);
-  display.display();
-  html_jam.replace("[||]EdItAbLe TeXt[||]", htmlResponse);
-  sendHtmlAndExecute(html_jam.c_str(), jamFunction);
-  html_jam.replace(htmlResponse, "[||]EdItAbLe TeXt[||]");
-  updateDisplay(menu_number);
-}
+const String menu_main[] PROGMEM = {title_menu_btJam,    title_menu_wifiJam, title_menu_bleJam,   title_menu_zigbeeJam,
+                                    title_menu_droneJam, title_menu_miscJam, title_menu_settings, title_menu_about};
+const String menu_btJam[] PROGMEM = {"Channel List (21)", option_allJam, option_randomJam, option_return};
+const String menu_wifiJam[] PROGMEM = {option_allJam, "Single channel", option_return};
+const String menu_droneJam[] PROGMEM = {option_randomJam, option_allJam, option_return};
+const String menu_settings[] PROGMEM = {title_menu_radios, title_menu_jammingModes, "Factory Reset", option_return};
+const String menu_jammingModes[] PROGMEM = {"Simultaneous", "Standalone"};
 
-void miscChannelsHandler() {
-  int channel1 = server.arg("start").toInt();
-  int channel2 = server.arg("stop").toInt();
-  html_jam.replace("[||]EdItAbLe TeXt[||]", "Jamming from "+String(channel1)+" to "+String(channel2));
-  sendHtmlAndExecute(html_jam.c_str()); 
-  display.clearDisplay();
-  display.setCursor(0, 0);
-  display.println("Start");
-  display.setCursor(96, 0);
-  display.println("Stop");
-  display.setCursor(52, 0);
-  display.println("Width");
-  display.setCursor(8, 10);
-  display.println(String(channel1));
-  display.setCursor(60, 10);
-  display.println(String(channel2 - channel1));
-  display.setCursor(100, 10);
-  display.println(String(channel2));
-  display.setCursor(0, 20);
-  display.println("Jamming Started");
-  display.display();
-  misc_jam(channel1, channel2);
-  html_jam.replace("Jamming from "+String(channel1)+" to "+String(channel2), "[||]EdItAbLe TeXt[||]");
-  updateDisplay(menu_number);
-}
+/*
+ ============================================================================
+                      MENU SYSTEM ARCHITECTURE
+ ============================================================================
 
-void wifiChannelsHandler() {
-  int channel = server.arg("channel").toInt();
+ This is a hierarchical, non-blocking menu system with up to 3 depth levels.
+ Each menu item can either:
+   a) Navigate to a submenu (has nullptr check)
+   b) Execute a leaf action (returns bool for completion status)
 
-  display.clearDisplay();
-  display.drawBitmap(0, 0, bitmap_wifi_jam, 128, 64, WHITE);
-  display.display();
-  html_jam.replace("[||]EdItAbLe TeXt[||]", "Jamming "+String(channel)+" WiFi Channel");
-  sendHtmlAndExecute(html_jam.c_str());
-  wifi_channel(channel);
-  html_jam.replace("Jamming "+String(channel)+" WiFi Channel", "[||]EdItAbLe TeXt[||]");
-  updateDisplay(menu_number);
-}
+ STRUCTURE:
+   - Menu items are stored as String arrays (e.g., menu_main, menu_btJam)
+   - Menu sizes are pre-calculated in size arrays to avoid repetitive sizeof()
+   - Menu tree pointers form a 3D navigation structure indexed by [depth][position]
+   - Action functions are stored in parallel arrays matching the menu structure
 
-void nRF24SettingsHandler(String htmlResponse){
-  String modulesScript = "<script>window.currentModules = [";
-  for (int i = 0; i < nrf24_count; i++) {
-      modulesScript += "{ce: " + String(ce_pins[i]) + ", csn: " + String(csn_pins[i]) + "}";
-      if (i < nrf24_count - 1) {
-          modulesScript += ",";
-      }
-  }
-  modulesScript += "];</script>";
-  htmlResponse.replace("</body>", modulesScript + "</body>");
-  sendHtmlAndExecute(htmlResponse.c_str());
-}
+ NAVIGATION:
+   - menuDepth: Current depth (0=main, 1=submenu, 2=sub-submenu)
+   - menuPositions[3]: Current selection at each depth level
+   - Next/Prev buttons: Navigate within current menu (wrapping)
+   - OK button: Either enter submenu or execute leaf action
+   - Return option: Go back to previous depth (automatic)
 
-void settingsHandler(String htmlResponse, int index, bool editable) {
-  if (index == 1010110){
-    htmlResponse.replace("<div class=\"version-badge\">version</div>", "<div class=\"version-badge\">"+Version_Number+"</div>");
-  }
-  else if (editable)
-    htmlResponse.replace("<!-- "+String(index)+" --><button class=\"button\"", "<!-- "+String(index)+" --><button class=\"button_installed\"");
-  sendHtmlAndExecute(htmlResponse.c_str());
-  if (index == 1010110){
-    htmlResponse.replace("<div class=\"version-badge\">"+Version_Number+"</div>", "<div class=\"version-badge\">version</div>");
-  }
-  else if (editable)
-    htmlResponse.replace("<!-- "+String(index)+" --><button class=\"button_installed\"", "<!-- "+String(index)+" --><button class=\"button\"");
-}
+ ACTIONS (Non-Blocking):
+   - Action functions return bool:
+     * false = still running (display updated, stay in menu)
+     * true = complete (go back to previous depth)
+   - Each action manages its own state using static variables
+   - Use millis() timer instead of delay() to keep loop responsive
+   - Buttons remain responsive during action execution
 
-void storeEEPROMAndReset(int index, int value, int &targetVar){
-  settingsHandler(html_pls_reboot, 0, false);
-  display.clearDisplay();
-  display.drawBitmap(0, 0, bitmap_pls_reboot, 128, 64, WHITE);
-  display.display();
-  EEPROM.write(index, value);
-  EEPROM.commit();
-  targetVar = value;
-  sendHtmlAndExecute(html);
-  ESP.restart();
-}
+ ADDING NEW MENUS/ACTIONS:
+   1. Create menu array (const String menu_name[])
+   2. Add size to depth_*_menuSizes arrays
+   3. Add pointer to depth_*_menuTree arrays
+   4. Create action function (bool action_name())
+   5. Add function pointer to depth_*_actions arrays
+   6. Add forward declaration
 
-void storeEEPROMAndSet(int index, int value, int &targetVar) {
-  EEPROM.write(index, value);
-  EEPROM.commit();
-  targetVar = value;
-  sendHtmlAndExecute(html);
-}
+ ============================================================================
+ */
+const String *depth_0_menuTree PROGMEM = menu_main;
+const String depth_0_titleTree[] PROGMEM = {title_menu_main};
+const String *depth_1_menuTree[] PROGMEM = {
+    menu_btJam,    // Submenu for "Bluetooth Jam"
+    menu_wifiJam,  // Submenu for "WiFi Jam"
+    nullptr,       // No submenu for "BLE Jam"
+    nullptr,       // No submenu for "Zigbee Jam"
+    menu_droneJam, // Submenu for "Drone Jam"
+    nullptr,       // No submenu for "Misc Jam"
+    menu_settings, // Submenu for "Settings"
+    nullptr        // No submenu for "About"
+};
+const String *depth_1_titleTree PROGMEM = menu_main; // Order is the same, so no need to redefine it.
 
-void registerRoute(const char *path, void (*handler)()) {
-  server.on(path, handler);
-}
+// Depth 2 sub-arrays (one per depth_1 menu that has children)
+const String *depth_2_btJam[] PROGMEM = {
+    nullptr,  // "Channel List (21)"
+    nullptr,  // "All channels (sequential)"
+    nullptr,  // "All channels (random)"
+    nullptr   // "Return"
+};
 
-void saveWiFiSettings(const char *new_ssid, const char *new_password) {
-  for (int i = 0; i < 32; i++) {
-    if (i < strlen(new_ssid)) {
-      EEPROM.write(11 + i, new_ssid[i]);
-    } else {
-      EEPROM.write(11 + i, 0);
-    }
-  }
+const String *depth_2_wifiJam[] PROGMEM = {
+    nullptr,  // "All channels (random)"
+    nullptr,  // "Single channel"
+    nullptr   // "Return"
+};
 
-  for (int i = 0; i < 32; i++) {
-    if (i < strlen(new_password)) {
-      EEPROM.write(43 + i, new_password[i]);
-    } else {
-      EEPROM.write(43 + i, 0);
-    }
-  }
+const String *depth_2_droneJam[] PROGMEM = {
+    nullptr,  // "All channels (random)"
+    nullptr,  // "All channels (sequential)"
+    nullptr   // "Return"
+};
 
-  EEPROM.commit();
-}
+const String *depth_2_settings[] PROGMEM = {
+    nullptr,           // "Radios"
+    menu_jammingModes, // "Jamming Mode" - has submenu!
+    nullptr,           // "Factory Reset"
+    nullptr            // "Return"
+};
 
-void initWiFiSettings() {
-  if (EEPROM.read(11) == 255) {
-    saveWiFiSettings(default_ssid, default_password);
-  }
-}
+// Depth 2 menu tree - indexed by depth_1 position
+const String **depth_2_menuTree[] PROGMEM = {
+    depth_2_btJam,    // [0] Bluetooth Jam submenus
+    depth_2_wifiJam,  // [1] WiFi Jam submenus
+    nullptr,          // [2] BLE Jam - no submenus
+    nullptr,          // [3] Zigbee Jam - no submenus
+    depth_2_droneJam, // [4] Drone Jam submenus
+    nullptr,          // [5] Misc Jam - no submenus
+    depth_2_settings, // [6] Settings submenus
+    nullptr           // [7] About - no submenus
+};
 
-String getSSIDFromEEPROM() {
-  char ssid[33] = {0};
-  for (int i = 0; i < 32; i++) {
-    ssid[i] = EEPROM.read(11 + i);
-    if (ssid[i] == 0)
-      break;
-  }
-  return String(ssid);
-}
+// Pre-calculated menu sizes
+const uint8_t depth_0_menuSize PROGMEM = sizeof(menu_main) / sizeof(menu_main[0]);
 
-String getPasswordFromEEPROM() {
-  char password[33] = {0};
-  for (int i = 0; i < 32; i++) {
-    password[i] = EEPROM.read(43 + i);
-    if (password[i] == 0)
-      break;
-  }
-  return String(password);
-}
+const uint8_t depth_1_menuSizes[] PROGMEM = {
+    sizeof(menu_btJam) / sizeof(menu_btJam[0]),      // [0] Bluetooth Jam
+    sizeof(menu_wifiJam) / sizeof(menu_wifiJam[0]),  // [1] WiFi Jam
+    0,                                                // [2] BLE Jam - no submenu
+    0,                                                // [3] Zigbee Jam - no submenu
+    sizeof(menu_droneJam) / sizeof(menu_droneJam[0]),// [4] Drone Jam
+    0,                                                // [5] Misc Jam - no submenu
+    sizeof(menu_settings) / sizeof(menu_settings[0]),// [6] Settings
+    0                                                 // [7] About - no submenu
+};
 
-void handleSaveWiFiSettings() {
-  String new_ssid = server.arg("ssid");
-  String new_password = server.arg("password");
+const uint8_t depth_2_btJam_sizes[] PROGMEM = {0, 0, 0, 0}; // All nullptr
+const uint8_t depth_2_wifiJam_sizes[] PROGMEM = {0, 0, 0}; // All nullptr
+const uint8_t depth_2_droneJam_sizes[] PROGMEM = {0, 0, 0}; // All nullptr
+const uint8_t depth_2_settings_sizes[] PROGMEM = {
+    0,  // [0] Radios - nullptr
+    sizeof(menu_jammingModes) / sizeof(menu_jammingModes[0]), // [1] Jamming Mode
+    0,  // [2] Factory Reset - nullptr
+    0   // [3] Return - nullptr
+};
 
-  if (new_ssid == "" && new_password == "") {
-    server.send(200, "text/html", html_pls_reboot);
-    storeEEPROMAndSet(8, 1, access_point);
-    return;
-  }
+const uint8_t *depth_2_menuSizes[] PROGMEM = {
+    depth_2_btJam_sizes,    // [0]
+    depth_2_wifiJam_sizes,  // [1]
+    nullptr,                // [2]
+    nullptr,                // [3]
+    depth_2_droneJam_sizes, // [4]
+    nullptr,                // [5]
+    depth_2_settings_sizes, // [6]
+    nullptr                 // [7]
+};
 
-  saveWiFiSettings(new_ssid.c_str(), new_password.c_str());
+// Function pointer type for menu actions (returns true when action is complete)
+typedef bool (*MenuAction)();
 
-  server.send(200, "text/html", html_pls_reboot);
-  delay(1000);
-  ESP.restart();
-}
+// Currently running action (executed each loop until it returns true)
+static MenuAction currentAction = nullptr;
 
-void handleResetWiFiSettings() {
-  saveWiFiSettings(default_ssid, default_password);
+// Forward declarations for menu actions
+bool action_notImplemented();
+bool action_bleJam();
+bool action_zigbeeJam();
+bool action_miscJam();
+bool action_about();
+bool action_btChannelList();
+bool action_btAllSequential();
+bool action_btAllRandom();
+bool action_wifiAllRandom();
+bool action_wifiSingleChannel();
+bool action_droneAllRandom();
+bool action_droneAllSequential();
+bool action_radiosConfig();
+bool action_factorySettings();
+bool action_jammingSimultaneous();
+bool action_jammingStandalone();
 
-  server.send(200, "text/html", html_pls_reboot);
-  delay(1000);
-  ESP.restart();
-}
+// Menu action arrays (parallel to menu trees)
+const MenuAction depth_0_actions[] = {
+    nullptr,             // [0] Bluetooth Jam - has submenu
+    nullptr,             // [1] WiFi Jam - has submenu
+    action_bleJam,       // [2] BLE Jam - leaf action
+    action_zigbeeJam,    // [3] Zigbee Jam - leaf action
+    nullptr,             // [4] Drone Jam - has submenu
+    action_miscJam,      // [5] Misc Jam - leaf action
+    nullptr,             // [6] Settings - has submenu
+    action_about         // [7] About - leaf action
+};
 
-void handleFileUpload() {
-  HTTPUpload &upload = server.upload();
-  static unsigned long lastUpdate = 0;
-  const unsigned long updateInterval = 100;
+const MenuAction depth_1_btJam_actions[] = {
+    action_btChannelList,    // [0] Channel List (21)
+    action_btAllSequential,  // [1] All channels (sequential)
+    action_btAllRandom,      // [2] All channels (random)
+    nullptr                  // [3] Return - handled separately
+};
 
-  if (upload.status == UPLOAD_FILE_START) {
-    Serial.printf("Update: %s\n", upload.filename.c_str());
-    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-      Update.printError(Serial);
-      server.send(200, "text/plain", "Update Failed");
-      return;
-    } else {
-      server.sendContent(html_upload_progress);
-      lastUpdate = millis();
-    }
-  } else if (upload.status == UPLOAD_FILE_WRITE) {
-    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-      Update.printError(Serial);
-    }
+const MenuAction depth_1_wifiJam_actions[] = {
+    action_wifiAllRandom,      // [0] All channels (random)
+    action_wifiSingleChannel,  // [1] Single channel
+    nullptr                    // [2] Return
+};
 
-    if (millis() - lastUpdate >= updateInterval) {
-      lastUpdate = millis();
-      int progress = (100.0 * Update.progress() / Update.size());
-      server.sendContent(String("<script>updateProgress(") + progress +
-                         ");</script>");
-    }
-  } else if (upload.status == UPLOAD_FILE_END) {
-    if (Update.end(true)) {
-      Serial.printf("Update Success: %u bytes\n", upload.totalSize);
-      server.sendContent(String("<script>updateProgress(100); "
-                                "document.getElementById('status').innerHTML = "
-                                "'Update Success';</script>"));
-      display.clearDisplay();
-      display.drawBitmap(0, 0, bitmap_pls_reboot, 128, 64, WHITE);
-      display.display();
-      delay(1000);
-      ESP.restart();
-    } else {
-      Update.printError(Serial);
-      server.sendContent("<script>document.getElementById('status').innerHTML "
-                         "= 'Update Failed';</script>");
-    }
-  }
-}
+const MenuAction depth_1_droneJam_actions[] = {
+    action_droneAllRandom,     // [0] All channels (random)
+    action_droneAllSequential, // [1] All channels (sequential)
+    nullptr                    // [2] Return
+};
 
-void misc() {
-  auto display_info = [&](String info) {
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.println("Start");
-    display.setCursor(96, 0);
-    display.println("Stop");
-    display.setCursor(52, 0);
-    display.println("Width");
-    display.setCursor(8, 10);
-    display.println(String(channel1));
-    display.setCursor(60, 10);
-    display.println(String(channel2 - channel1));
-    display.setCursor(100, 10);
-    display.println(String(channel2));
-    display.setCursor(0, 20);
-    display.println(info);
-    display.display();
-  };
+const MenuAction depth_1_settings_actions[] = {
+    action_radiosConfig, // [0] Radios
+    nullptr,             // [1] Jamming Mode - has submenu
+    action_factorySettings,    // [2] Factory Reset
+    nullptr              // [3] Return
+};
 
-  display_info("");
+const MenuAction *depth_1_actions[] = {
+    depth_1_btJam_actions,      // [0] Bluetooth Jam actions
+    depth_1_wifiJam_actions,    // [1] WiFi Jam actions
+    nullptr,                    // [2] BLE Jam - no submenu
+    nullptr,                    // [3] Zigbee Jam - no submenu
+    depth_1_droneJam_actions,   // [4] Drone Jam actions
+    nullptr,                    // [5] Misc Jam - no submenu
+    depth_1_settings_actions,   // [6] Settings actions
+    nullptr                     // [7] About - no submenu
+};
 
-  auto incrementChannel = [&](int &channel) {
-    channel++;
-    if (channel > 125) {
-      channel = 0;
-    }
-  };
-  auto reduceChannel = [&](int &channel) {
-    channel--;
-    if (channel < 0) {
-      channel = 125;
-    }
-  };
+const MenuAction depth_2_settings_jammingMode_actions[] = {
+    action_jammingSimultaneous, // [0] Simultaneous
+    action_jammingStandalone    // [1] Standalone
+};
 
-  while (true) {
-    butt1.tick();
-    buttNext.tick();
-    buttPrevious.tick();
-    if (buttons == 0) {
-      if (butt1.isSingle() || butt1.isHold()) {
-        if (butt1.isHold()) {
-          delay(100);
-        }
-        incrementChannel(flag == 0 ? channel1 : channel2);
-        display_info("");
-      } else if (butt1.isDouble()) {
-        if (flag == 0) {
-          flag = 1;
-        } else {
-          if (channel1 > channel2) {
-            display_info("Error: Second < First");
-            flag = 0;
-          } else {
-            display_info("Jamming Started");
-            misc_jam(channel1, channel2);
-            break;
-          }
-        }
-      }
-    }
-    if (buttons == 1) {
-      if (buttNext.isSingle() || buttNext.isHold()) {
-        if (buttNext.isHold()) {
-          delay(100);
-        }
-        incrementChannel(flag == 0 ? channel1 : channel2);
-        display_info("");
-      } else if (butt1.isSingle()) {
-        if (flag == 0) {
-          flag = 1;
-        } else {
-          if (channel1 > channel2) {
-            display_info("Error: Second < First");
-            flag = 0;
-          } else {
-            display_info("Jamming Started");
-            misc_jam(channel1, channel2);
-            break;
-          }
-        }
-      }
-    }
-    if (buttons == 2) {
-      if (buttNext.isSingle() || buttNext.isHold()) {
-        if (buttNext.isHold()) {
-          delay(100);
-        }
-        incrementChannel(flag == 0 ? channel1 : channel2);
-        display_info("");
-      }
-      if (buttPrevious.isSingle() || buttPrevious.isHold()) {
-        if (buttPrevious.isHold()) {
-          delay(100);
-        }
-        reduceChannel(flag == 0 ? channel1 : channel2);
-        display_info("");
-      } else if (butt1.isSingle()) {
-        if (flag == 0) {
-          flag = 1;
-        } else {
-          if (channel1 > channel2) {
-            display_info("Error: Second < First");
-            flag = 0;
-          } else {
-            display_info("Jamming Started");
-            misc_jam(channel1, channel2);
-            break;
-          }
-        }
-      }
-    }
-  }
-}
+// Note: Only settings->jamming mode has depth 2 actions
+const MenuAction *depth_2_settings_actions[] = {
+    nullptr,                             // [0] Radios - no submenu
+    depth_2_settings_jammingMode_actions,// [1] Jamming Mode actions
+    nullptr,                             // [2] Factory Reset - no submenu
+    nullptr                              // [3] Return
+};
 
-void wifi_select() {
-  auto display_info = [&](int flag) {
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.println("channel: " + String(flag));
-    display.display();
-  };
-  while (true) {
-    butt1.tick();
-    buttNext.tick();
-    buttPrevious.tick();
-    if (buttons == 0) {
-      if (butt1.isSingle()) {
-        menu_number = (menu_number + 1) % 2;
-        display.clearDisplay();
-        const uint8_t *bitmap =
-            (menu_number == 0) ? bitmap_wifi_all : bitmap_wifi_select;
-        display.drawBitmap(0, 0, bitmap, 128, 64, WHITE);
-        display.display();
-      }
-      if (butt1.isHolded()) {
-        if (menu_number == 1) {
-          flag = 0;
-          display_info(flag);
-          while (true) {
-            butt1.tick();
-            if (butt1.isSingle()) {
-              flag = flag + 1;
-              if (flag > 13) {
-                flag = 0;
-              }
-              display_info(flag);
-            }
-            if (butt1.isHolded()) {
-              display.clearDisplay();
-              display.drawBitmap(0, 0, bitmap_wifi_jam, 128, 64, WHITE);
-              display.display();
-              wifi_channel(flag);
-              break;
-            }
-          }
-        }
-        display.clearDisplay();
-        display.drawBitmap(0, 0, bitmap_wifi_jam, 128, 64, WHITE);
-        display.display();
-        wifi_jam();
-        break;
-      }
-    }
-    if (buttons == 1) {
-      if (buttNext.isSingle()) {
-        menu_number = (menu_number + 1) % 2;
-        display.clearDisplay();
-        const uint8_t *bitmap =
-            (menu_number == 0) ? bitmap_wifi_all : bitmap_wifi_select;
-        display.drawBitmap(0, 0, bitmap, 128, 64, WHITE);
-        display.display();
-      }
-      if (butt1.isSingle()) {
-        if (menu_number == 1) {
-          flag = 0;
-          display_info(flag);
-          while (true) {
-            butt1.tick();
-            buttNext.tick();
-            if (buttNext.isSingle()) {
-              flag = flag + 1;
-              if (flag > 13) {
-                flag = 0;
-              }
-              display_info(flag);
-            }
-            if (butt1.isSingle()) {
-              display.clearDisplay();
-              display.drawBitmap(0, 0, bitmap_wifi_jam, 128, 64, WHITE);
-              display.display();
-              wifi_channel(flag);
-              break;
-            }
-          }
-        }
-        display.clearDisplay();
-        display.drawBitmap(0, 0, bitmap_wifi_jam, 128, 64, WHITE);
-        display.display();
-        wifi_jam();
-        break;
-      }
-    }
-    if (buttons == 2) {
-      if (buttNext.isSingle()) {
-        menu_number = (menu_number + 1) % 2;
-        display.clearDisplay();
-        const uint8_t *bitmap =
-            (menu_number == 0) ? bitmap_wifi_all : bitmap_wifi_select;
-        display.drawBitmap(0, 0, bitmap, 128, 64, WHITE);
-        display.display();
-      }
-      if (buttPrevious.isSingle()) {
-        menu_number = (menu_number + 1) % 2;
-        display.clearDisplay();
-        const uint8_t *bitmap =
-            (menu_number == 0) ? bitmap_wifi_all : bitmap_wifi_select;
-        display.drawBitmap(0, 0, bitmap, 128, 64, WHITE);
-        display.display();
-      }
+const MenuAction **depth_2_actions[] = {
+    nullptr,                    // [0] BT Jam - no depth 2 actions
+    nullptr,                    // [1] WiFi Jam - no depth 2 actions
+    nullptr,                    // [2] BLE Jam
+    nullptr,                    // [3] Zigbee Jam
+    nullptr,                    // [4] Drone Jam - no depth 2 actions
+    nullptr,                    // [5] Misc Jam
+    depth_2_settings_actions,   // [6] Settings has depth 2 actions
+    nullptr                     // [7] About
+};
 
-      if (butt1.isSingle()) {
-        if (menu_number == 1) {
-          flag = 0;
-          display_info(flag);
-          while (true) {
-            butt1.tick();
-            buttNext.tick();
-            buttPrevious.tick();
-            if (buttNext.isSingle()) {
-              flag = flag + 1;
-              if (flag > 13) {
-                flag = 0;
-              }
-              display_info(flag);
-            }
-            if (buttPrevious.isSingle()) {
-              flag = flag - 1;
-              if (flag < 0) {
-                flag = 13;
-              }
-              if (flag > 13) {
-                flag = 0;
-              }
-              display_info(flag);
-            }
-            if (butt1.isSingle()) {
-              display.clearDisplay();
-              display.drawBitmap(0, 0, bitmap_wifi_jam, 128, 64, WHITE);
-              display.display();
-              wifi_channel(flag);
-              break;
-            }
-          }
-        }
-        display.clearDisplay();
-        display.drawBitmap(0, 0, bitmap_wifi_jam, 128, 64, WHITE);
-        display.display();
-        wifi_jam();
-        break;
-      }
-    }
-  }
-}
+bool uiRefresh = false;
+uint8_t menuDepth = 0;
+uint8_t menuPositions[3] = {0, 0, 0};
 
-void access_poin_off() {
-  settingsHandler(html_pls_reboot, 0, false);
-  storeEEPROMAndSet(8, 1, access_point);
-  display.clearDisplay();
-  display.drawBitmap(0, 0, bitmap_pls_reboot, 128, 64, WHITE);
-  display.display();
-  delay(1000);
-  ESP.restart();
-}
+bool load_configs();
+void error(const String &msg);
+String get_battery_percentage();
+void factory_settings();
+bool settings_subMenu();
 
 void setup() {
   Serial.begin(115200);
-  EEPROM.begin(EEPROM_SIZE);
+  Serial.printf("Log level: %d\n", ARDUHAL_LOG_LEVEL);
+  display.begin();
+  display.setRotation(2);
+  ui.setDisplay(&display, displayWidth, displayHeight);
+  ui.setTitleFont(&Picopixel);
+  ui.setContentFont(&Picopixel);
+  buttonOk.begin(PIN_OK, INPUT_PULLUP, true);
+  buttonNext.begin(PIN_NEXT, INPUT_PULLUP, true);
+  buttonPrev.begin(PIN_PREV, INPUT_PULLUP, true);
 
-  for (int i = 0; i < 11; i++) {
-    if (EEPROM.read(i) == 255) {
-      EEPROM.write(i, 0);
-    }
+  if (buttonOk.isPressedRaw() && buttonPrev.isPressedRaw()) {
+    factory_settings();
   }
 
-  handlenRF24Init();
-
-  initWiFiSettings();
-
-  // Load settings
-  bluetooth_jam_method = EEPROM.read(0);
-  drone_jam_method = EEPROM.read(1);
-  display_setting = EEPROM.read(2);
-  wifi_jam_method = EEPROM.read(3);
-  zigbee_jam_method = EEPROM.read(5);
-  misc_jam_method = EEPROM.read(6);
-  logo = EEPROM.read(7);
-  access_point = EEPROM.read(8);
-  buttons = EEPROM.read(9);
-  Separate_or_together = EEPROM.read(10);
-
-  if (access_point == 0) {
-    String current_ssid = getSSIDFromEEPROM();
-    String current_password = getPasswordFromEEPROM();
-
-    WiFi.softAP(current_ssid.c_str(), current_password.c_str());
-
-    // Register routes
-    registerRoute("/", handleRoot);
-    registerRoute("/bluetooth_jam", []() {
-      jamHandler(String("Bluetooth Jamming"), bluetooth_jam, bitmap_bluetooth_jam);
-    });
-    registerRoute("/drone_jam", []() {
-      jamHandler(String("Drone Jamming"), drone_jam, bitmap_drone_jam);
-    });
-    registerRoute("/wifi_jam", []() {
-      jamHandler(String("WiFi Jamming"), wifi_jam, bitmap_wifi_jam);
-    });
-    registerRoute("/ble_jam",
-                  []() { jamHandler(String("BLE Jamming"), ble_jam, bitmap_ble_jam); });
-    registerRoute("/zigbee_jam", []() {
-      jamHandler(String("Zigbee Jamming"), zigbee_jam, bitmap_zigbee_jam);
-    });
-    registerRoute("/misc_jammer",
-                  []() { sendHtmlAndExecute(html_misc_jammer); });
-    registerRoute("/misc_jam", miscChannelsHandler);
-    registerRoute("/wifi_selected_jam", wifiChannelsHandler);
-
-    registerRoute("/setting_display",
-                  []() { settingsHandler(html_display_settings, display_setting, true); });
-    registerRoute("/setting_bluetooth_jam",
-                  []() { settingsHandler(html_bluetooth_setings, bluetooth_jam_method, true); });
-    registerRoute("/setting_drone_jam",
-                  []() { settingsHandler(html_drone_setings, drone_jam_method, true); });
-    registerRoute("/setting_separate_together",
-                  []() { settingsHandler(html_separate_or_together, Separate_or_together, true); });
-    registerRoute("/setting_misc_jam",
-                  []() { settingsHandler(html_misc_setings, misc_jam_method, true); });
-    registerRoute("/setting_logo",
-                  []() { settingsHandler(html_logo_setings, logo, true); });
-    registerRoute("/setting_buttons",
-                  []() { settingsHandler(html_buttons_settings, buttons, true); });
-    registerRoute("/OTA", []() { settingsHandler(html_ota, 1010110, false); });
-    registerRoute("/wifi_select", []() { settingsHandler(html_wifi_select, 0, false); });
-    registerRoute("/wifi_channel",
-                  []() { settingsHandler(html_wifi_channel, 0, false); });
-    registerRoute("/wifi_settings",
-                  []() { settingsHandler(html_wifi_settings, wifi_jam_method, true); });
-    registerRoute("/nrf24_settings",
-                  []() { nRF24SettingsHandler(html_nrf24_settings); });
-
-    server.on(
-        "/update", HTTP_POST,
-        []() {
-          server.send(200, "text/plain",
-                      (Update.end() ? "Update Success" : "Update Failed"));
-        },
-        handleFileUpload);
-    server.on("/save_wifi_settings", handleSaveWiFiSettings);
-    server.on("/reset_wifi_settings", handleResetWiFiSettings);
-
-    registerRoute("/bluetooth_method_0",
-                  []() { storeEEPROMAndSet(0, 0, bluetooth_jam_method); });
-    registerRoute("/bluetooth_method_1",
-                  []() { storeEEPROMAndSet(0, 1, bluetooth_jam_method); });
-    registerRoute("/bluetooth_method_2",
-                  []() { storeEEPROMAndSet(0, 2, bluetooth_jam_method); });
-    registerRoute("/drone_method_0",
-                  []() { storeEEPROMAndSet(1, 0, drone_jam_method); });
-    registerRoute("/drone_method_1",
-                  []() { storeEEPROMAndSet(1, 1, drone_jam_method); });
-    registerRoute("/separate_or_together_method_0",
-                  []() { storeEEPROMAndSet(4, 0, Separate_or_together); });
-    registerRoute("/separate_or_together_method_1",
-                  []() { storeEEPROMAndSet(4, 1, Separate_or_together); });
-    registerRoute("/misc_method_0",
-                  []() { storeEEPROMAndSet(6, 0, misc_jam_method); });
-    registerRoute("/misc_method_1",
-                  []() { storeEEPROMAndSet(6, 1, misc_jam_method); });
-    registerRoute("/logo_on", []() { storeEEPROMAndSet(7, 0, logo); });
-    registerRoute("/logo_off", []() { storeEEPROMAndSet(7, 1, logo); });
-    registerRoute("/enable_display", []() { storeEEPROMAndReset(2, 0, display_setting); });
-    registerRoute("/disable_display", []() { storeEEPROMAndReset(2, 1, display_setting); });
-    registerRoute("/button_method_0",
-                  []() { storeEEPROMAndSet(9, 0, buttons); });
-    registerRoute("/button_method_1",
-                  []() { storeEEPROMAndSet(9, 1, buttons); });
-    registerRoute("/button_method_2",
-                  []() { storeEEPROMAndSet(9, 2, buttons); });
-    registerRoute("/access_point_off", []() { access_poin_off(); });
-    registerRoute("/set_nrf24_pins", []() { handlernRF24Pins(); });
-
-    server.begin();
+  if (!load_configs()) {
+    error("Failed to load configurations.");
   }
 
-  Serial.println(logotype+"\n\n");
-
-  Serial.println("help ==> Displays a list of available commands\n");
-
-  butt1.setClickTimeout(200);
-  buttNext.setClickTimeout(200);
-  buttPrevious.setClickTimeout(200);
-  butt1.setTimeout(600);
-  buttNext.setTimeout(600);
-  buttPrevious.setTimeout(600);
-  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
-  display.setTextColor(WHITE);
-  display.setTextSize(1);
-  if (display_setting){
-    display.ssd1306_command(SSD1306_DISPLAYOFF);
-  }
-  if (logo == 0) {
-    display.clearDisplay();
-    display.drawBitmap(0, 0, bitmap_logo, 128, 64, WHITE);
-    display.display();
-    delay(2000);
-  }
-
-  display.setCursor(0, 0);
   display.clearDisplay();
-  display.drawBitmap(0, 0, bitmap_bluetooth_jammer, 128, 64, WHITE);
+  ui.showRunningActivity(*(bitmap_boot_logo.frames), bitmap_boot_logo.width, bitmap_boot_logo.height, "otg jammer");
   display.display();
-}
-
-void executeAction(int menuNum) {
-  if (nrf24_count <= 0) {
-    display.clearDisplay();
-    display.setCursor(40, 0);
-    display.println("WARNING");
-
-    display.setCursor(5, 10);
-    display.println("nRF24 not configured");
-
-    display.setCursor(7, 20);
-    display.println("Configure in web UI");
-
-    display.display();
-    while (nrf24_count <= 0) {
-      server.handleClient();
-      delay(100);
-    }
-  }
-  if (menuNum == 5)
-    misc();
-  display.clearDisplay();
-  const uint8_t *bitmap = (menu_number == 0)   ? bitmap_bluetooth_jam
-                          : (menu_number == 1) ? bitmap_drone_jam
-                          : (menu_number == 2) ? bitmap_wifi_all
-                          : (menu_number == 3) ? bitmap_ble_jam
-                          : (menu_number == 4) ? bitmap_zigbee_jam
-                          : (menu_number == 6) ? bitmap_pls_reboot
-                                               : NULL;
-  display.drawBitmap(0, 0, bitmap, 128, 64, WHITE);
-  display.display();
-
-  switch (menu_number) {
-  case 0:
-    bluetooth_jam();
-    break;
-  case 1:
-    drone_jam();
-    break;
-  case 2:
-    wifi_select();
-    break;
-  case 3:
-    ble_jam();
-    break;
-  case 4:
-    zigbee_jam();
-    break;
-  case 6:
-    storeEEPROMAndSet(8, 0, logo);
-    break;
-  }
-  if (menuNum != 6)
-    updateDisplay(menuNum);
+  delay(2000);
+  uiRefresh = true;
 }
 
 void loop() {
-  butt1.tick();
-  buttNext.tick();
-  buttPrevious.tick();
+  buttonOk.loop();
+  buttonNext.loop();
+  buttonPrev.loop();
+  ui.update();
+  display.display();
 
-  SerialCommands();
+  // If an action is active, execute it on every loop iteration.
+  // When it reports completion, return to previous depth level.
+  if (currentAction != nullptr) {
+    bool done = currentAction();
+    if (done) {
+      currentAction = nullptr;
+      if (menuDepth > 0) {
+        menuDepth--;
+        menuPositions[menuDepth + 1] = 0; // Reset child position
+      }
+      uiRefresh = true;
+    }
+    // Skip menu navigation while an action is active.
+    return;
+  }
 
-  if (access_point == 0)
-    server.handleClient();
-  if (buttons == 0) {
-    if (butt1.isSingle()) {
-      menu_number = (menu_number + 1) % (access_point == 0 ? 6 : 7);
-      updateDisplay(menu_number);
+  // Render current menu level
+  if (uiRefresh) {
+    uiRefresh = false;
+    
+    const String *currentMenu = nullptr;
+    String currentTitle = "";
+    uint8_t menuSize = 0;
+
+    // Determine which menu to display based on current depth
+    if (menuDepth == 0) {
+      currentMenu = depth_0_menuTree;
+      currentTitle = title_menu_main;
+      menuSize = depth_0_menuSize;
+    } 
+    else if (menuDepth == 1) {
+      currentMenu = depth_1_menuTree[menuPositions[0]];
+      currentTitle = menu_main[menuPositions[0]];
+      menuSize = depth_1_menuSizes[menuPositions[0]];
     }
-    if (butt1.isHolded()) {
-      executeAction(menu_number);
-    }
-  } else if (buttons == 1) {
-    if (butt1.isSingle()) {
-      executeAction(menu_number);
-    }
-    if (buttNext.isSingle()) {
-      menu_number = (menu_number + 1) % (access_point == 0 ? 6 : 7);
-      updateDisplay(menu_number);
-    }
-  } else if (buttons == 2) {
-    if (butt1.isSingle()) {
-      executeAction(menu_number);
+    else if (menuDepth == 2) {
+      if (depth_2_menuTree[menuPositions[0]] != nullptr) {
+        currentMenu = depth_2_menuTree[menuPositions[0]][menuPositions[1]];
+        if (currentMenu != nullptr) {
+          currentTitle = depth_1_menuTree[menuPositions[0]][menuPositions[1]];
+          menuSize = depth_2_menuSizes[menuPositions[0]][menuPositions[1]];
+        }
+      }
     }
 
-    if (buttNext.isSingle()) {
-      menu_number = (menu_number + 1) % (access_point == 0 ? 6 : 7);
-      updateDisplay(menu_number);
-    }
-
-    if (buttPrevious.isSingle()) {
-      menu_number = (menu_number - 1 + (access_point == 0 ? 6 : 7)) %
-                    (access_point == 0 ? 6 : 7);
-      updateDisplay(menu_number);
+    if (currentMenu != nullptr && menuSize > 0) {
+      ui.optionSelectScreen(currentTitle, get_battery_percentage(), currentMenu, menuSize, menuPositions[menuDepth]);
     }
   }
+
+  // Handle button input
+  if (buttonNext.wasPressed()) {
+    uint8_t menuSize = 0;
+    if (menuDepth == 0) {
+      menuSize = depth_0_menuSize;
+    } else if (menuDepth == 1) {
+      menuSize = depth_1_menuSizes[menuPositions[0]];
+    } else if (menuDepth == 2 && depth_2_menuSizes[menuPositions[0]] != nullptr) {
+      menuSize = depth_2_menuSizes[menuPositions[0]][menuPositions[1]];
+    }
+    
+    if (menuSize > 0) {
+      menuPositions[menuDepth] = (menuPositions[menuDepth] + 1) % menuSize;
+    }
+    buttonNext.resetPressedState();
+    uiRefresh = true;
+  }
+
+  if (buttonPrev.wasPressed()) {
+    uint8_t menuSize = 0;
+    if (menuDepth == 0) {
+      menuSize = depth_0_menuSize;
+    } else if (menuDepth == 1) {
+      menuSize = depth_1_menuSizes[menuPositions[0]];
+    } else if (menuDepth == 2 && depth_2_menuSizes[menuPositions[0]] != nullptr) {
+      menuSize = depth_2_menuSizes[menuPositions[0]][menuPositions[1]];
+    }
+    
+    if (menuSize > 0) {
+      menuPositions[menuDepth] = (menuPositions[menuDepth] - 1 + menuSize) % menuSize;
+    }
+    buttonPrev.resetPressedState();
+    uiRefresh = true;
+  }
+
+  if (buttonOk.wasPressed()) {
+    buttonOk.resetPressedState();
+    
+    // Check if "Return" option was selected (always last item)
+    bool isReturn = false;
+    if (menuDepth == 1) {
+      uint8_t menuSize = depth_1_menuSizes[menuPositions[0]];
+      if (menuSize > 0) {
+        isReturn = (menuPositions[1] == menuSize - 1);
+      }
+    }
+
+    if (isReturn) {
+      // Go back to previous depth
+      if (menuDepth > 0) {
+        menuDepth--;
+        menuPositions[menuDepth + 1] = 0; // Reset child position
+        uiRefresh = true;
+      }
+    } else {
+      // Try to enter submenu
+      bool hasSubmenu = false;
+      
+      if (menuDepth == 0) {
+        // Check if depth_1 has a submenu
+        hasSubmenu = (depth_1_menuTree[menuPositions[0]] != nullptr);
+      } else if (menuDepth == 1) {
+        // Check if depth_2 has a submenu
+        if (depth_2_menuTree[menuPositions[0]] != nullptr) {
+          hasSubmenu = (depth_2_menuTree[menuPositions[0]][menuPositions[1]] != nullptr);
+        }
+      }
+
+      if (hasSubmenu && menuDepth < 2) {
+        // Enter submenu
+        menuDepth++;
+        menuPositions[menuDepth] = 0;
+        uiRefresh = true;
+      } else {
+        // Leaf action - resolve and start executing on each loop tick
+        MenuAction action = nullptr;
+
+        if (menuDepth == 0) {
+          action = depth_0_actions[menuPositions[0]];
+        } else if (menuDepth == 1) {
+          if (depth_1_actions[menuPositions[0]] != nullptr) {
+            action = depth_1_actions[menuPositions[0]][menuPositions[1]];
+          }
+        } else if (menuDepth == 2) {
+          if (depth_2_actions[menuPositions[0]] != nullptr &&
+              depth_2_actions[menuPositions[0]][menuPositions[1]] != nullptr) {
+            action = depth_2_actions[menuPositions[0]][menuPositions[1]][menuPositions[2]];
+          }
+        }
+
+        // Start the action; it will be executed in subsequent loop iterations
+        currentAction = (action != nullptr) ? action : action_notImplemented;
+      }
+    }
+  }
+}
+
+bool action_notImplemented() {
+  static uint32_t startTime = 0;
+  static const uint32_t DURATION = 2000;
+  
+  // First call - initialize and display
+  if (startTime == 0) {
+    ui.runningActivityScreen("Not Implemented", get_battery_percentage(), *(bitmap_information_sign.frames),
+                             bitmap_information_sign.width, bitmap_information_sign.height,
+                             "This feature is not yet implemented.");
+    display.display();
+    startTime = millis();
+    return false;  // Still running
+  }
+  
+  // Check if duration elapsed
+  if (millis() - startTime >= DURATION) {
+    startTime = 0;  // Reset for next call
+    return true;    // Action complete
+  }
+  
+  return false;  // Still running
+}
+
+bool action_bleJam() {
+  return action_notImplemented();
+  // TODO: Implement BLE jamming logic
+}
+
+bool action_zigbeeJam() {
+  return action_notImplemented();
+  // TODO: Implement Zigbee jamming
+}
+
+bool action_miscJam() {
+  return action_notImplemented();
+  // TODO: Implement misc jamming
+}
+
+bool action_about() {
+  static uint32_t startTime = 0;
+  static const uint32_t DURATION = 3000;
+  
+  if (startTime == 0) {
+    ui.runningActivityScreen("About", get_battery_percentage(), *(bitmap_information_sign.frames),
+                             bitmap_information_sign.width, bitmap_information_sign.height,
+                             "OTG Jammer v1.0\nby fpp3\n2026");
+    display.display();
+    startTime = millis();
+    return false;
+  }
+  
+  if (millis() - startTime >= DURATION) {
+    startTime = 0;
+    return true;
+  }
+  
+  return false;
+}
+
+bool action_btChannelList() {
+  return action_notImplemented();
+  // TODO: Show Bluetooth channel list
+}
+
+bool action_btAllSequential() {
+  return action_notImplemented();
+  // TODO: Jam all BT channels sequentially
+}
+
+bool action_btAllRandom() {
+  return action_notImplemented();
+  // TODO: Jam all BT channels randomly
+}
+
+bool action_wifiAllRandom() {
+  return action_notImplemented();
+  // TODO: Jam WiFi channels randomly
+}
+
+bool action_wifiSingleChannel() {
+  return action_notImplemented();
+  // TODO: Jam single WiFi channel
+}
+
+bool action_droneAllRandom() {
+  return action_notImplemented();
+  // TODO: Jam drone frequencies randomly
+}
+
+bool action_droneAllSequential() {
+  return action_notImplemented();
+  // TODO: Jam drone frequencies sequentially
+}
+
+bool action_radiosConfig() {
+  return action_notImplemented();
+  // TODO: Configure radios
+}
+
+bool action_factorySettings() {
+  // Factory settings has its own blocking logic for now
+  factory_settings();
+  return true;  // Return immediately after calling
+}
+
+bool action_jammingSimultaneous() {
+  return action_notImplemented();
+  // TODO: Set jamming mode to simultaneous
+}
+
+bool action_jammingStandalone() {
+  return action_notImplemented();
+  // TODO: Set jamming mode to standalone
+}
+
+// ============== Config & Helper Functions ==============
+
+bool load_configs() {
+  Preferences prefs;
+  uint8_t numRadios;
+  size_t radioConfigSize;
+  radio_config_s *radiosConfig;
+  size_t jamModeSize;
+  jam_tx_mode_e jamMode;
+
+  if (prefs.begin(CONFIG_NAMESPACE, true) == false) {
+    log_d("Failed to open namespace %s!", CONFIG_NAMESPACE);
+    return 0;
+  } // Read-only mode
+  for (uint8_t i = 0; CONFIG_MANDATORY_KEYS[i] != nullptr; i++) {
+    if (!prefs.isKey(CONFIG_MANDATORY_KEYS[i])) {
+      log_d("Missing mandatory namespace key %s!", CONFIG_MANDATORY_KEYS[i]);
+      prefs.end();
+      return 0;
+    }
+  }
+
+  numRadios = prefs.getUChar(CONFIG_KEY_RADIO_NUM, 0);
+  if (numRadios > 0) {
+    radioConfigSize = prefs.getBytesLength(CONFIG_KEY_RADIO_CONFIG_STRUCT);
+    radiosConfig = new radio_config_s[numRadios];
+    if (radiosConfig == nullptr) {
+      log_d("Could not allocate memory for radiosConfig struct");
+      prefs.end();
+      return 0;
+    }
+    size_t readBytes = prefs.getBytes(CONFIG_KEY_RADIO_CONFIG_STRUCT, radiosConfig, sizeof(radio_config_s) * numRadios);
+    if (readBytes != radioConfigSize) {
+      log_d("readBytes != radioConfigSize");
+      prefs.end();
+      return 0;
+    }
+  }
+  jamModeSize = prefs.getBytesLength(CONFIG_KEY_RADIO_JAM_MODE);
+  size_t readBytes = prefs.getBytes(CONFIG_KEY_RADIO_JAM_MODE, &jamMode, sizeof(jam_tx_mode_e));
+  if (readBytes != jamModeSize) {
+    log_d("readBytes != jamModeSize");
+    prefs.end();
+    return 0;
+  }
+
+  load_radios(radiosConfig, numRadios);
+  set_jam_tx_mode(jamMode);
+
+  prefs.end();
+  log_d("Exit load_configs()");
+  return true; // Assume success for this example
+}
+
+void error(const String &msg) {
+  ui.runningActivityScreen("Error!", get_battery_percentage(), bitmap_error.frames, bitmap_error.frameCount,
+                           bitmap_error.width, bitmap_error.height, bitmap_error.frameDurationMs, msg);
+  while (1) {
+    ui.update();
+    display.display();
+  }
+}
+
+String get_battery_percentage() { return String(map(analogRead(PIN_VBAT), VBAT_VOLTAGE_EMPTY, VBAT_VOLTAGE_FULL, 0, 100)) + "%"; }
+
+void factory_settings() {
+  ui.runningActivityScreen("Factory Reset", get_battery_percentage(), *(bitmap_information_sign.frames),
+                           bitmap_information_sign.width, bitmap_information_sign.height, "Lift buttons to continue.");
+  display.display();
+  while (buttonOk.isPressedRaw() || buttonPrev.isPressedRaw())
+    ;
+  String options[] = {"Load", "Cancel"};
+  uint8_t pos = 1;
+  buttonOk.resetPressedState();
+  buttonNext.resetPressedState();
+  buttonPrev.resetPressedState();
+  while (buttonOk.wasPressed() == false) {
+    buttonOk.loop();
+    buttonNext.loop();
+    buttonPrev.loop();
+    if (buttonNext.wasPressed()) {
+      pos = (pos + 1) % 2;
+      log_d("buttonNext was pressed");
+      buttonNext.resetPressedState();
+    }
+    if (buttonPrev.wasPressed()) {
+      pos = (pos - 1) % 2;
+      log_d("buttonPrev was pressed");
+      buttonPrev.resetPressedState();
+    }
+    ui.confirmScreen("Factory Reset", get_battery_percentage(), *(bitmap_device_reset.frames),
+                     bitmap_device_reset.width, bitmap_device_reset.height, "Load factory Defaults?", options, 2, pos);
+    display.display();
+  }
+  if (pos == 0) {
+    log_d("Load factory settings");
+    Preferences prefs;
+    prefs.begin(CONFIG_NAMESPACE, false); // Read-write mode
+    prefs.clear();
+    prefs.putUChar(CONFIG_KEY_RADIO_NUM, 0);
+    jam_tx_mode_e defaultJamMode = JAM_TX_SIMULTANEOUS;
+    prefs.putBytes(CONFIG_KEY_RADIO_JAM_MODE, &defaultJamMode, sizeof(jam_tx_mode_e));
+    prefs.end();
+    ui.runningActivityScreen("Factory Reset", get_battery_percentage(), *(bitmap_check.frames), bitmap_check.width,
+                             bitmap_check.height, "Factory settings loaded.");
+    display.display();
+    delay(2000);
+    ESP.restart();
+  }
+  buttonOk.resetPressedState();
+  buttonNext.resetPressedState();
+  buttonPrev.resetPressedState();
+  log_d("Exit factory_settings()");
 }
